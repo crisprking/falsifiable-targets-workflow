@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+title: falsifiable-targets-workflow
+message: >-
+  If you use this workflow layer in your research, please cite both this
+  repository and the underlying falsifiable-targets engine.
+type: software
+authors:
+  - alias: crisprking
+repository-code: 'https://github.com/crisprking/falsifiable-targets-workflow'
+abstract: >-
+  Parallel batch-auditing layer for the falsifiable-targets drug-target
+  validation engine. Provides three equivalent execution paths
+  (standalone Python, Nextflow, Snakemake) producing identical audit
+  reports, plus an HTML dashboard and CI-friendly exit codes.
+keywords:
+  - drug discovery
+  - target validation
+  - workflow
+  - nextflow
+  - snakemake
+  - reproducibility
+license: Apache-2.0
+version: 1.0.0
+date-released: '2026-05-26'
+references:
+  - type: software
+    title: falsifiable-targets
+    repository-code: 'https://github.com/crisprking/falsifiable-targets'
+    version: '1.4.1'
+    notes: >-
+      The audit engine wrapped by this workflow layer. Ruleset v1.2.0,
+      SHA 35ef2b2ab5363298097962a0b6ae52c70d551a1edddc341054f75cb6e4fb7221.

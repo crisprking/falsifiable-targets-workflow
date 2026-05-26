@@ -1,0 +1,7 @@
+name: falsifiable-targets
+channels: [conda-forge, bioconda]
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - git+https://github.com/crisprking/falsifiable-targets.git@v1.4.1

@@ -1,0 +1,28 @@
+from pathlib import Path
+
+CLAIMS_DIR = Path(config.get("claims_dir", "claims"))
+REPORTS_DIR = Path(config.get("reports_dir", "reports"))
+OFFLINE = config.get("offline", False)
+
+CLAIMS = [p.stem for p in CLAIMS_DIR.glob("*.yaml")] + [p.stem for p in CLAIMS_DIR.glob("*.yml")]
+
+rule all:
+    input:
+        REPORTS_DIR / "audit_summary.json",
+        REPORTS_DIR / "audit_summary.html"
+
+rule ft_audit:
+    input:  CLAIMS_DIR / "{claim}.yaml"
+    output: REPORTS_DIR / "{claim}_audit.json"
+    params:
+        offline_flag = "--no-live" if OFFLINE else ""
+    shell:
+        "ft-audit {input} {params.offline_flag} --json-out {output}"
+
+rule aggregate:
+    input:  expand(REPORTS_DIR / "{claim}_audit.json", claim=CLAIMS)
+    output:
+        json = REPORTS_DIR / "audit_summary.json",
+        html = REPORTS_DIR / "audit_summary.html"
+    shell:
+        "python3 scripts/batch_audit.py --aggregate-only --reports-dir {REPORTS_DIR}"
