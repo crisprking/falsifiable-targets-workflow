@@ -1,0 +1,249 @@
+name: Workflow CI
+
+# Exercises the standalone batch runner against the example claims using
+# the pinned engine version. Runs on every push and PR. Matches the
+# engine's CI style so cross-version regressions get caught early.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin the engine version. Update here in lockstep with README.md,
+  # Dockerfile, and workflow/envs/falsifiable-targets.yaml when bumping.
+  ENGINE_VERSION: "v1.4.1"
+
+jobs:
+  batch:
+    name: Batch audit (Python ${{ matrix.python-version }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ['3.10', '3.11', '3.12']
+        include:
+          - os: macos-latest
+            python-version: '3.12'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install falsifiable-targets engine
+        run: |
+          python -m pip install --upgrade pip
+          pip install "git+https://github.com/crisprking/falsifiable-targets.git@${{ env.ENGINE_VERSION }}"
+
+      - name: Verify engine CLI is on PATH
+        run: |
+          ft-audit --help
+          ft-validate --help
+
+      - name: Run sentinel calibration (engine sanity check)
+        run: ft-smoke
+
+      - name: Validate all example claims against engine schema
+        run: |
+          for f in claims/*.yaml; do
+            echo "::group::Validating $f"
+            ft-validate "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Run batch audit (offline mode)
+        # Expected exit code: 2 (at least one FALSIFIED claim)
+        run: |
+          set +e
+          python scripts/batch_audit.py \
+            --claims-dir claims \
+            --reports-dir reports \
+            --offline \
+            --workers 2
+          rc=$?
+          set -e
+          if [ "$rc" != "2" ]; then
+            echo "::error::expected exit code 2 (FALSIFIED present); got $rc"
+            cat reports/audit_summary.json || true
+            exit 1
+          fi
+          echo "Exit code: $rc (FALSIFIED present — contract honored)"
+
+      - name: Verify report shape
+        run: |
+          python <<'EOF'
+          import json, sys
+          summary = json.load(open("reports/audit_summary.json"))
+
+          # Total claims processed
+          assert summary["total"] == 5, f"expected 5 claims, got {summary['total']}"
+
+          # Worst verdict
+          assert summary["worst_verdict"] == "FALSIFIED", \
+            f"expected worst=FALSIFIED, got {summary['worst_verdict']}"
+
+          # Exit code
+          assert summary["exit_code"] == 2, \
+            f"expected exit_code=2, got {summary['exit_code']}"
+
+          # Verdict mix (offline mode):
+          #   2 SURVIVED (hmgcr, tyk2)
+          #   2 FALSIFIED_WITH_CAVEATS (novel_caveats, ipi1)
+          #   1 FALSIFIED (synthetic_retracted)
+          counts = summary["counts"]
+          assert counts.get("SURVIVED") == 2, f"expected 2 SURVIVED, got {counts}"
+          assert counts.get("FALSIFIED_WITH_CAVEATS") == 2, f"expected 2 caveats, got {counts}"
+          assert counts.get("FALSIFIED") == 1, f"expected 1 FALSIFIED, got {counts}"
+
+          # Ruleset SHA pinned (no divergence)
+          assert not summary["ruleset_divergence"], "ruleset SHA divergence detected"
+          assert len(summary["ruleset_sha256"]) == 1, \
+            f"expected exactly 1 ruleset SHA, got {summary['ruleset_sha256']}"
+
+          # The ruleset SHA at the time of v1.0.0 release
+          EXPECTED_SHA = "35ef2b2ab5363298097962a0b6ae52c70d551a1edddc341054f75cb6e4fb7221"
+          assert summary["ruleset_sha256"][0] == EXPECTED_SHA, \
+            f"ruleset SHA drift: got {summary['ruleset_sha256'][0]}"
+
+          # Both report formats present
+          import os
+          assert os.path.exists("reports/audit_summary.json")
+          assert os.path.exists("reports/audit_summary.html")
+          # HTML must contain the banner
+          html = open("reports/audit_summary.html").read()
+          assert "FALSIFIED" in html, "FALSIFIED banner missing from HTML"
+
+          print("All assertions passed:")
+          print(f"  - {summary['total']} claims processed")
+          print(f"  - verdict mix: {counts}")
+          print(f"  - worst: {summary['worst_verdict']} (exit {summary['exit_code']})")
+          print(f"  - ruleset SHA: {summary['ruleset_sha256'][0][:16]}...")
+          EOF
+
+      - name: Test aggregate-only path
+        run: |
+          python scripts/batch_audit.py \
+            --aggregate-only \
+            --reports-dir reports
+
+      - name: Test dry-run path
+        run: |
+          python scripts/batch_audit.py \
+            --claims-dir claims \
+            --reports-dir /tmp/dryrun \
+            --dry-run
+
+      - name: Integration smoke — CRISPR converter
+        # Verifies the MAGeCK→claim conversion produces ft-validate-clean YAMLs.
+        # Uses the example_mageck_output.txt shipped in the repo.
+        run: |
+          python integrations/crispr/from_crispr_screen.py \
+            --input integrations/crispr/example_mageck_output.txt \
+            --format mageck \
+            --indication "test indication" \
+            --fdr-cutoff 0.05 \
+            --output /tmp/crispr_claims
+          # Every generated claim must validate against the engine schema
+          for f in /tmp/crispr_claims/*.yaml; do
+            ft-validate "$f"
+          done
+          # And the batch must run (in offline mode — no live API)
+          python scripts/batch_audit.py \
+            --claims-dir /tmp/crispr_claims \
+            --reports-dir /tmp/crispr_reports \
+            --offline --workers 2 || true   # exit code non-zero is fine here
+          # Audit summary must exist
+          test -f /tmp/crispr_reports/audit_summary.json
+
+      - name: Integration smoke — grant audit reporter
+        # Run the grant-audit reporter against a known SURVIVED claim.
+        run: |
+          python integrations/grant_audit/grant_audit.py \
+            --claim claims/tyk2_psoriasis.yaml \
+            --report /tmp/grant_tyk2.md \
+            --offline
+          # Report must mention the verdict and the ruleset SHA
+          grep -q "SURVIVED" /tmp/grant_tyk2.md
+          grep -q "35ef2b2ab5363298" /tmp/grant_tyk2.md
+          # And against a FALSIFIED_WITH_CAVEATS claim to exercise the caveat path
+          python integrations/grant_audit/grant_audit.py \
+            --claim claims/ipi1_madurella.yaml \
+            --report /tmp/grant_ipi1.md \
+            --offline
+          grep -q "FALSIFIED_WITH_CAVEATS" /tmp/grant_ipi1.md
+          grep -q "substantive caveats" /tmp/grant_ipi1.md
+
+      # Open Targets integration smoke is intentionally NOT in CI:
+      # it requires live access to api.platform.opentargets.org, which is
+      # flaky from CI runners and rate-limited. Test it locally with:
+      #   python integrations/opentargets/from_opentargets.py \
+      #     --disease MONDO_0005083 --top 3 --output /tmp/ot_smoke --dry-run
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audit-reports-py${{ matrix.python-version }}-${{ matrix.os }}
+          path: reports/
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build container
+        run: docker build --build-arg FT_REF=${{ env.ENGINE_VERSION }} -t falsifiable-targets-workflow:test .
+
+      - name: Verify container can run ft-audit --help
+        run: docker run --rm falsifiable-targets-workflow:test ft-audit --help
+
+      - name: Run sentinel calibration inside container
+        run: docker run --rm falsifiable-targets-workflow:test ft-smoke
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install ruff
+        run: pip install "ruff>=0.4"
+      - name: ruff check scripts
+        run: ruff check scripts/
+      - name: ruff format --check
+        # Advisory while project stabilizes
+        run: ruff format --check scripts/ || echo "::warning::Code not ruff-formatted (advisory)"
+
+  # Verify the git tag matches the CHANGELOG top entry on tagged releases
+  version-tag-match:
+    name: Version-tag consistency
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check CHANGELOG top entry matches tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # First "## [x.y.z]" line in CHANGELOG.md
+          CHANGELOG_VER=$(grep -m1 -oE '## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | sed -E 's/## \[([0-9.]+)\]/\1/')
+          if [ "$TAG" != "$CHANGELOG_VER" ]; then
+            echo "::error::Tag v$TAG does not match CHANGELOG.md top entry [$CHANGELOG_VER]"
+            exit 1
+          fi
+          echo "OK: tag v$TAG matches CHANGELOG entry [$CHANGELOG_VER]"

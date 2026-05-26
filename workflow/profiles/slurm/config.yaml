@@ -1,0 +1,7 @@
+executor: slurm
+jobs: 100
+default-resources:
+  - partition=normal
+  - mem_mb=4000
+  - runtime=60
+use-conda: true
